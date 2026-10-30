@@ -47,6 +47,8 @@ func startCamera(t *testing.T, cam *fakeCamera) string {
 }
 
 func (f *fakeCamera) serve() {
+	defer f.conn.Close()
+
 	rd := bufio.NewReader(f.conn)
 	for {
 		msg, err := readRequest(rd)

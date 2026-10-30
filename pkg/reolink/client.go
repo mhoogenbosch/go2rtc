@@ -141,7 +141,7 @@ func (c *Client) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver
 
 	// 8 kHz from a browser is doubled with a filter, other rates go through pcm.Transcode
 	var up *upsampler
-	if src := track.Codec; src.ClockRate*2 == rate && src.Channels <= 1 {
+	if src := track.Codec; src.ClockRate*2 == rate {
 		rate = src.ClockRate
 		up = &upsampler{}
 	}
@@ -182,6 +182,12 @@ func (c *Client) Stop() error {
 		}
 
 		go func() {
+			select {
+			case <-c.conn.done: // dead connection: nothing to flush, reset or log out
+				return
+			default:
+			}
+
 			c.mu.Lock()
 			talking := c.talking
 			var wait time.Duration

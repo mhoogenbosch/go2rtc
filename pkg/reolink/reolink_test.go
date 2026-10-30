@@ -191,3 +191,28 @@ func TestUpsampler(t *testing.T) {
 		require.Greater(t, 10*math.Log10(signal/noise), 30.0, "freq %v", freq)
 	}
 }
+
+// TestADPCMLayout pins the packing: RFC 3551 DVI4 puts the first sample in the high nibble
+func TestADPCMLayout(t *testing.T) {
+	block := (&adpcmEncoder{}).encodeBlock([]int16{32767, -32768, 0, 0})
+	require.Equal(t, []byte{0x00, 0x00, 0x00, 0x00, 0x7f, 0x28}, block)
+}
+
+// TestUpsamplerImage checks the image of 3.4 kHz speech, the top of what a browser sends at 8 kHz
+func TestUpsamplerImage(t *testing.T) {
+	src := make([]int16, 8000)
+	for i := range src {
+		src[i] = int16(10000 * math.Sin(2*math.Pi*3400*float64(i)/8000))
+	}
+	dst := (&upsampler{}).process(src)[100:]
+
+	level := func(freq float64) float64 {
+		k := 2 * math.Cos(2*math.Pi*freq/16000)
+		var s1, s2 float64
+		for _, v := range dst {
+			s1, s2 = float64(v)+k*s1-s2, s1
+		}
+		return 10 * math.Log10(s1*s1+s2*s2-k*s1*s2)
+	}
+	require.Greater(t, level(3400)-level(4600), 30.0)
+}
