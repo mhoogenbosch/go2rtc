@@ -107,7 +107,7 @@ func TestFrame(t *testing.T) {
 	require.Equal(t, uint16(520), binary.LittleEndian.Uint16(frame[4:]))
 	require.Equal(t, uint16(520), binary.LittleEndian.Uint16(frame[6:]))
 	require.Equal(t, []byte{0x00, 0x01}, frame[8:10])
-	require.Equal(t, uint16(256), binary.LittleEndian.Uint16(frame[10:]))
+	require.Equal(t, uint16(512), binary.LittleEndian.Uint16(frame[10:]))
 }
 
 // TestADPCM decodes the encoder output with a reference IMA decoder and checks the signal to noise ratio
@@ -159,8 +159,35 @@ func decodeBlock(b []byte) []int16 {
 		out = append(out, int16(predictor))
 	}
 	for _, v := range b[4:] {
-		decode(int(v & 0x0f))
 		decode(int(v >> 4))
+		decode(int(v & 0x0f))
 	}
 	return out
+}
+
+// TestUpsampler checks that interpolated 8 kHz audio follows the real 16 kHz signal, where
+// repeating samples would leave a strong image of the tone
+func TestUpsampler(t *testing.T) {
+	var sum float64
+	for _, h := range halfband {
+		sum += h
+	}
+	require.InDelta(t, 1.0, sum, 0.01) // no level change for the interpolated samples
+
+	for _, freq := range []float64{300, 1000, 3000} {
+		src := make([]int16, 800)
+		for i := range src {
+			src[i] = int16(10000 * math.Sin(2*math.Pi*freq*float64(i)/8000))
+		}
+		dst := (&upsampler{}).process(src)
+		require.Len(t, dst, 1600)
+
+		var signal, noise float64
+		for m := 100; m < len(dst); m++ {
+			want := 10000 * math.Sin(2*math.Pi*freq*float64(m-16)/16000) // delay: 8 input samples
+			signal += want * want
+			noise += (want - float64(dst[m])) * (want - float64(dst[m]))
+		}
+		require.Greater(t, 10*math.Log10(signal/noise), 30.0, "freq %v", freq)
+	}
 }

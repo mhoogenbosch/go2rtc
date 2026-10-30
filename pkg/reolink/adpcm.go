@@ -51,15 +51,16 @@ func (e *adpcmEncoder) encodeSample(sample int16) byte {
 }
 
 // encodeBlock returns a 4 byte preamble with the encoder state at the start of the block
-// (predictor int16 LE, step index, zero) and two samples per byte, first sample in the low nibble
+// (predictor int16 LE, step index, zero) and two samples per byte, first sample in the high nibble
+// as in RFC 3551 DVI4 (IMA WAV uses the low nibble first, which plays but sounds rough)
 func (e *adpcmEncoder) encodeBlock(samples []int16) []byte {
 	b := make([]byte, 4, 4+len(samples)/2)
 	binary.LittleEndian.PutUint16(b, uint16(int16(e.predictor)))
 	b[2] = byte(e.index)
 
 	for i := 0; i+1 < len(samples); i += 2 {
-		lo := e.encodeSample(samples[i])
-		hi := e.encodeSample(samples[i+1])
+		hi := e.encodeSample(samples[i])
+		lo := e.encodeSample(samples[i+1])
 		b = append(b, hi<<4|lo)
 	}
 	return b
@@ -69,14 +70,14 @@ func (e *adpcmEncoder) encodeBlock(samples []int16) []byte {
 var adpcmMagic = []byte{0x30, 0x31, 0x77, 0x62}
 
 // appendFrame packs an ADPCM block the way the camera packs its own audio: magic, the length twice,
-// an inner header 00 01 with half the block size, the block and zero padding to 8 bytes
+// an inner header 00 01 with the size of the packed samples, the block and zero padding to 8 bytes
 func appendFrame(dst, block []byte) []byte {
 	size := uint16(len(block) + 4)
 	dst = append(dst, adpcmMagic...)
 	dst = binary.LittleEndian.AppendUint16(dst, size)
 	dst = binary.LittleEndian.AppendUint16(dst, size)
 	dst = append(dst, 0x00, 0x01)
-	dst = binary.LittleEndian.AppendUint16(dst, uint16((len(block)-4)/2))
+	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(block)-4))
 	dst = append(dst, block...)
 	if n := len(block) % 8; n != 0 {
 		dst = append(dst, make([]byte, 8-n)...)

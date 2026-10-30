@@ -137,7 +137,15 @@ func (c *Client) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver,
 }
 
 func (c *Client) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
-	toPCM := pcm.Transcode(&core.Codec{Name: core.CodecPCML, ClockRate: uint32(c.cfg.sampleRate)}, track.Codec)
+	rate := uint32(c.cfg.sampleRate)
+
+	// 8 kHz from a browser is doubled with a filter, other rates go through pcm.Transcode
+	var up *upsampler
+	if src := track.Codec; src.ClockRate*2 == rate && src.Channels <= 1 {
+		rate = src.ClockRate
+		up = &upsampler{}
+	}
+	toPCM := pcm.Transcode(&core.Codec{Name: core.CodecPCML, ClockRate: rate}, track.Codec)
 
 	sender := core.NewSender(media, track.Codec)
 	sender.Handler = func(packet *rtp.Packet) {
@@ -145,6 +153,9 @@ func (c *Client) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver
 		samples := make([]int16, len(b)/2)
 		for i := range samples {
 			samples[i] = int16(binary.LittleEndian.Uint16(b[i*2:]))
+		}
+		if up != nil {
+			samples = up.process(samples)
 		}
 		if err := c.push(samples, len(packet.Payload)); err != nil && c.OnError != nil {
 			c.OnError(err)
@@ -185,12 +196,12 @@ func (c *Client) Stop() error {
 			}
 			if talking {
 				c.mu.Lock()
-				c.endTalk()
+				c.endTalk(true)
 				c.mu.Unlock()
 			}
 
 			c.conn.logout()
-			_ = c.conn.Close()
+			c.conn.closeGracefully()
 		}()
 	})
 	return nil
@@ -215,6 +226,10 @@ func (c *Client) keepalive(interval time.Duration) {
 
 // push opens a talk session on the first audio and sends full Talk messages
 func (c *Client) push(samples []int16, size int) error {
+	if c.stopped.Load() {
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -326,7 +341,7 @@ func (c *Client) onIdle() {
 		c.idle.Reset(wait)
 		return
 	}
-	c.endTalk()
+	c.endTalk(false)
 }
 
 // flush sends the remaining samples, padded with silence to whole blocks
@@ -340,12 +355,20 @@ func (c *Client) flush() {
 	c.samples = c.samples[:0]
 }
 
-// endTalk resets the session without waiting for the reply, so no caller blocks on a slow camera
-func (c *Client) endTalk() {
+// endTalk resets the session. Only Stop waits for the reply (in the background), the idle timer
+// does not, so a slow camera never holds up new audio.
+func (c *Client) endTalk(wait bool) {
 	c.talking = false
 	ch := byte(c.channel + 1)
-	ext := c.conn.encrypt([]byte(channelExt(c.channel)))
-	if err := c.conn.write(cmdTalkReset, c.conn.nextID(ch), classModern, ext, nil); err != nil && c.OnError != nil {
+
+	var err error
+	if wait {
+		_, err = c.conn.request(cmdTalkReset, ch, channelExt(c.channel), "")
+	} else {
+		ext := c.conn.encrypt([]byte(channelExt(c.channel)))
+		err = c.conn.write(cmdTalkReset, c.conn.nextID(ch), classModern, ext, nil)
+	}
+	if err != nil && c.OnError != nil {
 		c.OnError(err)
 	}
 }

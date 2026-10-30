@@ -298,6 +298,19 @@ func (c *conn) login(user, pass string) error {
 	return fmt.Errorf("reolink: login status %d", msg.status)
 }
 
+// closeGracefully lets the last messages reach the camera: closing a socket with unread data sends
+// a reset, which can drop what is still in the send buffer (the TalkReset and the logout)
+func (c *conn) closeGracefully() {
+	if tcp, ok := c.Conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+		select {
+		case <-c.done: // the camera closed its side, the read loop drained everything
+		case <-time.After(time.Second):
+		}
+	}
+	_ = c.Close()
+}
+
 func (c *conn) logout() {
 	body := xmlHeader + "<body>\n<LoginUser version=\"1.1\">\n<userVer>1</userVer>\n</LoginUser>\n</body>\n"
 	_ = c.write(cmdLogout, c.nextID(hostChannel), classModern, nil, c.encrypt([]byte(body)))
