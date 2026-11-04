@@ -53,7 +53,7 @@ func newProducer(s source, profile *Profile, talkFormat *baichuan.TalkFormat) *P
 	p.Medias = append(p.Medias, profile.pipeline.medias...)
 	p.Receivers = append(p.Receivers, profile.receivers...)
 	if talkFormat != nil {
-		p.talk = &backchannel{producer: p, format: *talkFormat}
+		p.talk = &backchannel{producer: p, format: *talkFormat, maxAhead: talkMaxAhead, gateSilence: true}
 		p.Medias = append(p.Medias, &core.Media{
 			Kind: core.KindAudio, Direction: core.DirectionSendonly,
 			Codecs: talkCodecs(),

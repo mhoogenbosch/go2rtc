@@ -18,6 +18,12 @@ const (
 	talkIdleTimeout = 5 * time.Second
 	// Bound each packet independently of the camera's encoder block size.
 	maxTalkPacketSamples = 4 * 8192
+	// talkMaxAhead limits how much audio may wait in the camera. A source faster than real time,
+	// such as a TTS file fetched over HTTP, would otherwise overflow the camera's buffer.
+	talkMaxAhead = time.Second
+	// talkSilenceLevel is the largest sample a packet may hold to count as silence. A muted browser
+	// microphone sends digital silence, PCMA 0xd5 decodes to 8.
+	talkSilenceLevel = 16
 )
 
 type talkSession interface {
@@ -32,6 +38,10 @@ type backchannel struct {
 	producer *Producer
 	format   baichuan.TalkFormat
 	start    talkStarter
+	// maxAhead > 0 paces writes to real time (see talkMaxAhead); the producer sets it
+	maxAhead time.Duration
+	// gateSilence keeps silence from opening a talk session, or from keeping one open
+	gateSilence bool
 
 	mu        sync.Mutex
 	closed    bool
@@ -39,10 +49,13 @@ type backchannel struct {
 	encoder   baichuan.ADPCMEncoder
 	codec     core.Codec
 	transcode func([]byte) []byte
+	upsample  *upsampler
 	samples   []int16
 	idle      *time.Timer
 	idleAt    time.Time
 	sender    *core.Sender
+	playEnd   time.Time
+	lastSound time.Time
 }
 
 func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
@@ -112,6 +125,13 @@ func (b *backchannel) setCodec(codec *core.Codec) error {
 	}
 	b.codec = *codec
 	target := &core.Codec{Name: core.CodecPCML, ClockRate: b.format.SampleRate, Channels: 1}
+	b.upsample = nil
+	if b.codec.ClockRate*2 == b.format.SampleRate {
+		// 8 kHz from a browser: pcm.Transcode would repeat every sample, which sounds harsh,
+		// so decode at the source rate and interpolate with a halfband filter instead
+		target.ClockRate = b.codec.ClockRate
+		b.upsample = &upsampler{}
+	}
 	b.transcode = pcm.Transcode(target, &b.codec)
 	b.samples = b.samples[:0]
 	return nil
@@ -133,25 +153,48 @@ func (b *backchannel) Write(payload []byte) error {
 	if inputSamples > maxTalkPacketSamples*uint64(b.codec.ClockRate)/uint64(b.format.SampleRate) {
 		return fmt.Errorf("reolink: talkback packet exceeds sample limit")
 	}
-	if err := b.open(); err != nil {
-		return err
-	}
 	pcmBytes := b.transcode(payload)
 	if len(pcmBytes)&1 != 0 {
 		return fmt.Errorf("reolink: talkback produced odd PCM length %d", len(pcmBytes))
+	}
+	samples := make([]int16, len(pcmBytes)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(pcmBytes[2*i:]))
+	}
+	if b.upsample != nil {
+		samples = b.upsample.process(samples)
+	}
+	if b.gateSilence {
+		now := time.Now()
+		quiet := silent(samples)
+		if !quiet {
+			b.lastSound = now
+		}
+		// Silence opens no session, and after talkIdleTimeout of silence it no longer keeps one
+		// open, so a muted browser microphone leaves the camera free for the Reolink app.
+		// Pauses in speech shorter than that are still sent.
+		if quiet && (b.talk == nil || now.Sub(b.lastSound) >= talkIdleTimeout) {
+			return nil
+		}
+	}
+	if err := b.open(); err != nil {
+		return err
 	}
 	blockSize := int(b.format.SamplesPerBlock)
 	if cap(b.samples) < blockSize {
 		b.samples = make([]int16, 0, blockSize)
 	}
-	for i := 0; i < len(pcmBytes); i += 2 {
-		b.samples = append(b.samples, int16(binary.LittleEndian.Uint16(pcmBytes[i:])))
+	for _, sample := range samples {
+		b.samples = append(b.samples, sample)
 		if len(b.samples) < blockSize {
 			continue
 		}
 		block, err := b.encoder.EncodeBlock(b.samples[:blockSize])
 		b.samples = b.samples[:0]
 		if err != nil {
+			return err
+		}
+		if err = b.pace(blockSize); err != nil {
 			return err
 		}
 		if err = b.talk.WriteBlock(b.producer.ctx, block); err != nil {
@@ -184,6 +227,7 @@ func (b *backchannel) open() error {
 		} else {
 			b.talk = talk
 			b.encoder = baichuan.ADPCMEncoder{}
+			b.playEnd = time.Time{}
 		}
 	}
 	cancel()
@@ -197,6 +241,45 @@ func (b *backchannel) open() error {
 		return fmt.Errorf("reolink: start talkback: %w", errors.Join(err, cleanup))
 	}
 	return nil
+}
+
+// pace waits while more than maxAhead of audio is queued in the camera, then books one block.
+// It runs under b.mu; the wait ends early when the producer stops.
+func (b *backchannel) pace(samples int) error {
+	if b.maxAhead <= 0 {
+		return nil
+	}
+	now := time.Now()
+	if b.playEnd.Before(now) {
+		b.playEnd = now
+	}
+	if ahead := b.playEnd.Sub(now); ahead > b.maxAhead {
+		if err := b.wait(ahead - b.maxAhead); err != nil {
+			return err
+		}
+	}
+	b.playEnd = b.playEnd.Add(time.Duration(samples) * time.Second / time.Duration(b.format.SampleRate))
+	return nil
+}
+
+func (b *backchannel) wait(d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-b.producer.ctx.Done():
+		return b.producer.ctx.Err()
+	}
+}
+
+func silent(samples []int16) bool {
+	for _, s := range samples {
+		if s > talkSilenceLevel || s < -talkSilenceLevel {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *backchannel) closeIdle() {

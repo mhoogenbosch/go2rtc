@@ -361,7 +361,8 @@ func TestProducerTalkUsesProfileInputAndStopsBeforeProfile(t *testing.T) {
 	if err = producer.AddTrack(media, codec, track); err != nil {
 		t.Fatal(err)
 	}
-	track.WriteRTP(&rtp.Packet{Payload: []byte{0xd5, 0xd5}})
+	// audible A-law: digital silence (0xd5) opens no talk session
+	track.WriteRTP(&rtp.Packet{Payload: []byte{0xaa, 0xaa}})
 	first := wantTalkOpen(t, opened)
 	wantBlock(t, first, format.BytesPerBlock())
 	if input.starts.Load() != 1 || input.channel.Load() != 2 {
@@ -398,7 +399,8 @@ func TestProducerFailureStopsProfileBeforeReconnect(t *testing.T) {
 	if err = producer.AddTrack(media, codec, track); err != nil {
 		t.Fatal(err)
 	}
-	track.WriteRTP(&rtp.Packet{Payload: []byte{0xd5, 0xd5}})
+	// audible A-law: digital silence (0xd5) opens no talk session
+	track.WriteRTP(&rtp.Packet{Payload: []byte{0xaa, 0xaa}})
 	select {
 	case err = <-done:
 		if err == nil || !strings.Contains(err.Error(), "sentinel producer failure") {
