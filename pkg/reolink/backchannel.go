@@ -19,11 +19,18 @@ const (
 	// Bound each packet independently of the camera's encoder block size.
 	maxTalkPacketSamples = 4 * 8192
 	// talkMaxAhead limits how much audio may wait in the camera. A source faster than real time,
-	// such as a TTS file fetched over HTTP, would otherwise overflow the camera's buffer.
+	// such as a TTS file fetched over HTTP, would otherwise overflow the camera's buffer. Pacing
+	// waits in the sender's handler, so such a source then fills core.Sender's buffer (128
+	// packets) and loses the rest: play it at real time (ffmpeg -re) for anything longer.
 	talkMaxAhead = time.Second
 	// talkSilenceLevel is the largest sample a packet may hold to count as silence. A muted browser
 	// microphone sends digital silence, PCMA 0xd5 decodes to 8.
 	talkSilenceLevel = 16
+	// talkSilenceHold: pauses in speech up to this long are sent; longer silence is not, so the idle
+	// timer ends the session about talkSilenceHold + talkIdleTimeout after the last sound
+	talkSilenceHold = 2 * time.Second
+	// talkRetryDelay is the rest the camera gets after a failed talk attempt
+	talkRetryDelay = 5 * time.Second
 )
 
 type talkSession interface {
@@ -56,6 +63,7 @@ type backchannel struct {
 	sender    *core.Sender
 	playEnd   time.Time
 	lastSound time.Time
+	retryAt   time.Time
 }
 
 func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
@@ -79,7 +87,7 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
 	sender := core.NewSender(media, codec)
 	sender.Handler = func(packet *rtp.Packet) {
 		if err := p.talk.Write(packet.Payload); err != nil && p.ctx.Err() == nil {
-			p.fail(fmt.Errorf("reolink: write talkback: %w", err))
+			p.talkFailed(fmt.Errorf("reolink: write talkback: %w", err))
 		}
 	}
 	sender.HandleRTP(track)
@@ -170,14 +178,17 @@ func (b *backchannel) Write(payload []byte) error {
 		if !quiet {
 			b.lastSound = now
 		}
-		// Silence opens no session, and after talkIdleTimeout of silence it no longer keeps one
-		// open, so a muted browser microphone leaves the camera free for the Reolink app.
-		// Pauses in speech shorter than that are still sent.
-		if quiet && (b.talk == nil || now.Sub(b.lastSound) >= talkIdleTimeout) {
+		// Silence opens no session, and after talkSilenceHold it no longer keeps one open, so a
+		// muted browser microphone leaves the camera free for the Reolink app.
+		if quiet && (b.talk == nil || now.Sub(b.lastSound) >= talkSilenceHold) {
 			return nil
 		}
 	}
+	if b.talk == nil && time.Now().Before(b.retryAt) {
+		return nil
+	}
 	if err := b.open(); err != nil {
+		b.retryAt = time.Now().Add(talkRetryDelay)
 		return err
 	}
 	blockSize := int(b.format.SamplesPerBlock)
@@ -198,7 +209,11 @@ func (b *backchannel) Write(payload []byte) error {
 			return err
 		}
 		if err = b.talk.WriteBlock(b.producer.ctx, block); err != nil {
-			return err
+			if b.producer.ctx.Err() != nil {
+				return err // stopping: Close ends the session
+			}
+			b.retryAt = time.Now().Add(talkRetryDelay)
+			return errors.Join(err, b.closeSession())
 		}
 		b.producer.addSend(len(block))
 	}
@@ -296,7 +311,7 @@ func (b *backchannel) closeIdle() {
 	err := b.closeSession()
 	b.mu.Unlock()
 	if err != nil && b.producer.ctx.Err() == nil {
-		b.producer.fail(fmt.Errorf("reolink: stop idle talkback: %w", err))
+		b.producer.talkFailed(fmt.Errorf("reolink: stop idle talkback: %w", err))
 	}
 }
 

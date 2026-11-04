@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/baichuan"
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -22,10 +23,11 @@ type Producer struct {
 	stopErr error
 	send    atomic.Uint64
 
-	failureMu sync.Mutex
-	failure   error
-	talkMu    sync.Mutex
-	talk      *backchannel
+	failureMu  sync.Mutex
+	failure    error
+	talkMu     sync.Mutex
+	talk       *backchannel
+	talkLogged atomic.Int64 // unix nanoseconds of the last talkFailed warning
 }
 
 func (p *Producer) Format(state fmt.State, _ rune) {
@@ -74,6 +76,22 @@ func (p *Producer) Start() error {
 		<-p.profile.done
 		return p.terminalError(p.ctx.Err())
 	}
+}
+
+// talkFailed reports a failed talk attempt without ending the producer: the video and audio that
+// Frigate records keep running, and the backchannel retries after talkRetryDelay. A dead connection
+// ends the profile by itself. At most one warning per talkRetryDelay.
+func (p *Producer) talkFailed(err error) {
+	now := time.Now().UnixNano()
+	last := p.talkLogged.Load()
+	if now-last < int64(talkRetryDelay) || !p.talkLogged.CompareAndSwap(last, now) {
+		return
+	}
+	if p.profile == nil || p.profile.camera == nil || p.profile.camera.registry == nil {
+		return
+	}
+	p.profile.camera.registry.log.Warn().Err(err).Str("camera", p.profile.camera.remote).
+		Uint8("channel", p.profile.key.Channel).Msg("reolink talkback failed")
 }
 
 func (p *Producer) fail(err error) {

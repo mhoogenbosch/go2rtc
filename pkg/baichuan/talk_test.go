@@ -159,7 +159,9 @@ func serveTalk(conn net.Conn, cfg Config) error {
 		}
 		if data.header.Command != commandTalkData || len(data.payload) != 528 ||
 			binary.LittleEndian.Uint32(data.payload) != mediaADPCM ||
-			binary.LittleEndian.Uint16(data.payload[4:6]) != 516 {
+			binary.LittleEndian.Uint16(data.payload[4:6]) != 516 ||
+			binary.LittleEndian.Uint16(data.payload[8:10]) != 0x0100 ||
+			binary.LittleEndian.Uint16(data.payload[10:12]) != 508 { // packed nibbles of 1016 samples
 			return fmt.Errorf("invalid talk data: %+v payload=%d", data.header, len(data.payload))
 		}
 

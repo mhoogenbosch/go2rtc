@@ -384,23 +384,11 @@ func TestProducerFailureStopsProfileBeforeReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opener.input(0).startTalk = func(context.Context) (talkSession, error) {
-		return &fakeTalk{
-			format: format, blocks: make(chan []byte, 1), writeErr: errors.New("sentinel producer failure"),
-		}, nil
-	}
 	done := make(chan error, 1)
 	go func() { done <- producer.Start() }()
-	codec := &core.Codec{Name: core.CodecPCMA, ClockRate: 8000, Channels: 1}
-	media := &core.Media{
-		Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{codec},
-	}
-	track := core.NewReceiver(media, codec)
-	if err = producer.AddTrack(media, codec, track); err != nil {
-		t.Fatal(err)
-	}
-	// audible A-law: digital silence (0xd5) opens no talk session
-	track.WriteRTP(&rtp.Packet{Payload: []byte{0xaa, 0xaa}})
+	// a talk failure no longer ends the producer (TestBackchannelWriteFailureKeepsProducer), so the
+	// failure path is driven directly
+	producer.fail(errors.New("sentinel producer failure"))
 	select {
 	case err = <-done:
 		if err == nil || !strings.Contains(err.Error(), "sentinel producer failure") {

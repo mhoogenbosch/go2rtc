@@ -97,15 +97,21 @@ func TestBackchannelAddTrackReplacementAndIdleReopen(t *testing.T) {
 	}
 }
 
-func TestBackchannelWriteFailureCancelsProducer(t *testing.T) {
+// A failed talk attempt closes the talk session and rests talkRetryDelay, but must not cancel the
+// producer: that would also stop the video and audio Frigate records from this camera.
+func TestBackchannelWriteFailureKeepsProducer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p := &Producer{ctx: ctx, cancel: cancel}
 	format := baichuan.TalkFormat{SampleRate: 16000, SamplePrecision: 16, SamplesPerBlock: 4}
 	b := &backchannel{producer: p, format: format}
+	opened := make(chan struct{}, 2)
+	closed := make(chan struct{}, 2)
 	b.start = func(context.Context) (talkSession, error) {
+		opened <- struct{}{}
 		return &fakeTalk{
-			format: format, blocks: make(chan []byte, 1), writeErr: errors.New("sentinel write"),
+			format: format, writeErr: errors.New("sentinel write"),
+			closeFn: func() error { closed <- struct{}{}; return nil },
 		}, nil
 	}
 	p.talk = b
@@ -117,12 +123,17 @@ func TestBackchannelWriteFailureCancelsProducer(t *testing.T) {
 	}
 	track.WriteRTP(&rtp.Packet{Payload: []byte{0xd5, 0xd5}})
 	select {
-	case <-p.ctx.Done():
+	case <-closed:
 	case <-time.After(time.Second):
-		t.Fatal("talk write failure did not cancel producer")
+		t.Fatal("failed talk session was not closed")
 	}
-	if err := p.terminalError(context.Canceled); err == nil || !strings.Contains(err.Error(), "sentinel write") {
-		t.Fatalf("unexpected terminal error: %v", err)
+	track.WriteRTP(&rtp.Packet{Payload: []byte{0xd5, 0xd5}}) // within talkRetryDelay: no new attempt
+	time.Sleep(50 * time.Millisecond)
+	if n := len(opened); n != 1 {
+		t.Fatalf("talk attempts: %d, want 1 during the retry delay", n)
+	}
+	if err := p.ctx.Err(); err != nil {
+		t.Fatalf("talk write failure cancelled the producer: %v", err)
 	}
 	if err := b.Close(); err != nil {
 		t.Fatal(err)

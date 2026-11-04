@@ -83,7 +83,6 @@ type Talk struct {
 
 	mu        sync.Mutex
 	closed    bool
-	sequence  uint16
 	closeOnce sync.Once
 	closeDone chan struct{}
 	closeErr  error
@@ -173,11 +172,10 @@ func (t *Talk) WriteBlock(ctx context.Context, block []byte) error {
 	if len(block) != t.format.BytesPerBlock() {
 		return fmt.Errorf("baichuan: ADPCM block size %d, want %d", len(block), t.format.BytesPerBlock())
 	}
-	payload, err := buildTalkPayload(block, t.sequence)
+	payload, err := buildTalkPayload(block)
 	if err != nil {
 		return err
 	}
-	t.sequence++
 	return t.client.writeRequest(ctx, request{
 		command: commandTalkData, channel: t.channel, class: classOffset,
 		extension: t.extension, payload: payload, binary: true,
@@ -206,9 +204,12 @@ func (t *Talk) Close(ctx context.Context) error {
 	}
 }
 
-func buildTalkPayload(block []byte, sequence uint16) ([]byte, error) {
-	if len(block) > int(^uint16(0))-4 {
-		return nil, fmt.Errorf("baichuan: ADPCM block too large: %d", len(block))
+// buildTalkPayload frames one DVI4 block (4-byte header plus nibbles). The inner header is 00 01 and
+// then the size of the packed nibbles. An RLC-833A reads that field: in listening tests a block of
+// 1024 samples sounded clean with 512 and distorted with 256.
+func buildTalkPayload(block []byte) ([]byte, error) {
+	if len(block) < 4 || len(block) > int(^uint16(0))-4 {
+		return nil, fmt.Errorf("baichuan: ADPCM block size %d out of range", len(block))
 	}
 	size := len(block) + 4
 	total := 8 + size + int(padding(uint32(size)))
@@ -217,7 +218,7 @@ func buildTalkPayload(block []byte, sequence uint16) ([]byte, error) {
 	binary.LittleEndian.PutUint16(b[4:6], uint16(size))
 	binary.LittleEndian.PutUint16(b[6:8], uint16(size))
 	binary.LittleEndian.PutUint16(b[8:10], 0x0100)
-	binary.LittleEndian.PutUint16(b[10:12], sequence)
+	binary.LittleEndian.PutUint16(b[10:12], uint16(len(block)-4))
 	copy(b[12:], block)
 	return b, nil
 }

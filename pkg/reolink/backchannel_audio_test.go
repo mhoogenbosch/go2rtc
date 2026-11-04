@@ -30,6 +30,11 @@ func TestUpsampler(t *testing.T) {
 		if len(dst) != 1600 {
 			t.Fatalf("output length %d, want 1600", len(dst))
 		}
+		for i := 8; i < len(src); i++ { // even outputs are the input, 8 samples late
+			if dst[2*i] != src[i-8] {
+				t.Fatalf("%v Hz: output %d = %d, want input %d = %d", freq, 2*i, dst[2*i], i-8, src[i-8])
+			}
+		}
 
 		var signal, noise float64
 		for m := 100; m < len(dst); m++ {
@@ -83,7 +88,7 @@ func TestBackchannelUpsamplesBrowserAudio(t *testing.T) {
 		}
 	}
 
-	// 8 kHz PCM through Write: every even output sample is the input, the odd ones interpolate
+	// 8 kHz PCM through Write comes out at 16 kHz
 	var blocks [][]int16
 	talk := &fakeTalk{format: format, writeFn: func(_ context.Context, block []byte) error {
 		samples, err := baichuan.DecodeADPCMBlock(block)
@@ -147,7 +152,7 @@ func TestBackchannelSilenceGate(t *testing.T) {
 	}
 
 	b.mu.Lock()
-	b.lastSound = time.Now().Add(-talkIdleTimeout)
+	b.lastSound = time.Now().Add(-talkSilenceHold)
 	idleAt := b.idleAt
 	b.mu.Unlock()
 	if err := b.Write(quiet); err != nil { // long silence no longer keeps the session busy
@@ -161,6 +166,66 @@ func TestBackchannelSilenceGate(t *testing.T) {
 	}
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// After the idle timer closed a session, silence does not reopen it and speech does, with a fresh
+// encoder and play clock (from Fable's review, 04-11-2026)
+func TestBackchannelSilenceGateReopen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	format := baichuan.TalkFormat{SampleRate: 16000, SamplePrecision: 16, SamplesPerBlock: 4}
+	opens, closes := 0, 0
+	b := &backchannel{
+		producer: &Producer{ctx: ctx, cancel: cancel}, format: format, gateSilence: true, maxAhead: time.Second,
+	}
+	b.start = func(context.Context) (talkSession, error) {
+		opens++
+		return &fakeTalk{
+			format:  format,
+			writeFn: func(context.Context, []byte) error { return nil },
+			closeFn: func() error { closes++; return nil },
+		}, nil
+	}
+	if err := b.setCodec(&core.Codec{Name: core.CodecPCMA, ClockRate: 8000, Channels: 1}); err != nil {
+		t.Fatal(err)
+	}
+	quiet, loud := make([]byte, 160), make([]byte, 160)
+	for i := range quiet {
+		quiet[i], loud[i] = 0xd5, 0xaa
+	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(b.Write(loud))
+	must(b.Write(quiet)) // carries the filter tail of the sound
+	must(b.Write(quiet))
+	b.mu.Lock()
+	b.lastSound = time.Now().Add(-talkSilenceHold)
+	b.idleAt = time.Now().Add(-time.Second)
+	b.mu.Unlock()
+	must(b.Write(quiet)) // gated
+	b.closeIdle()
+	if closes != 1 || b.talk != nil {
+		t.Fatalf("idle close: closes=%d open=%v", closes, b.talk != nil)
+	}
+	must(b.Write(quiet))
+	if opens != 1 {
+		t.Fatalf("silence reopened the session: opens=%d", opens)
+	}
+	must(b.Write(loud))
+	if opens != 2 {
+		t.Fatalf("speech did not reopen the session: opens=%d", opens)
+	}
+	if ahead := time.Until(b.playEnd); ahead > 50*time.Millisecond {
+		t.Fatalf("play clock not reset on reopen: %v ahead", ahead)
+	}
+	must(b.Close())
+	if closes != 2 {
+		t.Fatalf("closes=%d, want 2", closes)
 	}
 }
 
