@@ -68,3 +68,40 @@ func TestOpenReentrantNoRace(t *testing.T) {
 		t.Fatal("expected second Open to be rejected by the guard")
 	}
 }
+
+// TestSendTextStalledPeerDoesNotBlock: a camera that stops reading the control
+// connection must not pin ctrlMu forever, or Close (setTalkState + DeleteObject)
+// hangs the talk teardown. net.Pipe has no buffer, so a peer that never reads
+// stalls every write.
+func TestSendTextStalledPeerDoesNotBlock(t *testing.T) {
+	old := ctrlWriteTimeout
+	ctrlWriteTimeout = 50 * time.Millisecond
+	defer func() { ctrlWriteTimeout = old }()
+
+	ours, theirs := net.Pipe()
+	defer ours.Close()
+	defer theirs.Close()
+
+	tr := NewNetSDKTransport("127.0.0.1:37777", "u", "p", 0, time.Second)
+	tr.ctrl = ours
+
+	done := make(chan error, 1)
+	go func() { done <- tr.sendText(ours, []string{"Method:Test"}) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("write to a stalled peer reported success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendText blocked on a stalled peer")
+	}
+
+	// The mutex must be free again: a second write also returns promptly.
+	go func() { done <- tr.sendText(ours, []string{"Method:Test"}) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctrlMu still held after the bounded write")
+	}
+}

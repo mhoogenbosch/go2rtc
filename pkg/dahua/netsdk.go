@@ -433,6 +433,13 @@ var loginBackoff sync.Map // credentials key -> time.Time of the last refusal
 
 const loginRetryBackoff = 30 * time.Second
 
+// ctrlWriteTimeout bounds every write on the control (and text-on-sub)
+// connection. keepAliveLoop and sendText write while holding a mutex that
+// Close also needs; without a deadline a camera that stops reading (wifi drop
+// without RST, full send buffer) pins that mutex and hangs the talk teardown.
+// A var so tests can shorten it.
+var ctrlWriteTimeout = 5 * time.Second
+
 func (t *NetSDKTransport) backoffKey() string {
 	return t.addr + "|" + t.user + "|" + passFingerprint(t.pass)
 }
@@ -693,7 +700,7 @@ func (t *NetSDKTransport) keepAliveLoop() {
 				return
 			}
 			t.ctrlMu.Lock()
-			_, err := conn.Write(frame)
+			_, err := writeBounded(conn, frame)
 			t.ctrlMu.Unlock()
 			if err != nil {
 				return
@@ -873,14 +880,25 @@ func (t *NetSDKTransport) sendText(conn net.Conn, lines []string) error {
 	// streams never interleave.
 	if conn == t.sub {
 		t.mu.Lock()
-		_, err := conn.Write(frame)
+		_, err := writeBounded(conn, frame)
 		t.mu.Unlock()
 		return err
 	}
 	t.ctrlMu.Lock()
-	_, err := conn.Write(frame)
+	_, err := writeBounded(conn, frame)
 	t.ctrlMu.Unlock()
 	return err
+}
+
+// writeBounded writes b with a ctrlWriteTimeout deadline and clears the
+// deadline again, so a stalled peer returns an error instead of blocking.
+func writeBounded(conn net.Conn, b []byte) (int, error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(ctrlWriteTimeout)); err != nil {
+		return 0, err
+	}
+	n, err := conn.Write(b)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return n, err
 }
 
 // awaitText reads until a 0xF4 frame whose body mentions want shows up.
