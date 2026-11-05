@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -22,6 +23,10 @@ type Conn struct {
 
 	offer  string
 	closed core.Waiter
+
+	// talkUntil (unix nanoseconds): camera audio to this browser stays muted
+	// until then because the browser is talking, see TalkDuck.
+	talkUntil atomic.Int64
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
@@ -98,6 +103,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}()
 		}
 
+		// the browser's microphone (backchannel) drives TalkDuck
+		duck := TalkDuck > 0 && c.Mode == core.ModePassiveConsumer && remote.Kind() == webrtc.RTPCodecTypeAudio
+
 		for {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
@@ -114,6 +122,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			if len(packet.Payload) == 0 {
 				continue
+			}
+
+			if duck {
+				c.noteTalk(codec, packet)
 			}
 
 			track.WriteRTP(packet)

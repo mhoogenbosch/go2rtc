@@ -77,6 +77,11 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 		}
 	}
 
+	// camera audio to a browser that is talking through the camera, see TalkDuck
+	if TalkDuck > 0 && c.Mode == core.ModePassiveConsumer && media.Kind == core.KindAudio {
+		sender.Handler = c.duckAudio(sender.Handler)
+	}
+
 	// TODO: rewrite this dirty logic
 	// maybe not best solution, but ActiveProducer connected before AddTrack
 	if c.Mode != core.ModeActiveProducer {

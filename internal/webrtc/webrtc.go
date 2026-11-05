@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/api/ws"
@@ -22,6 +23,7 @@ func Init() {
 			Candidates []string         `yaml:"candidates"`
 			IceServers []pion.ICEServer `yaml:"ice_servers"`
 			Filters    webrtc.Filters   `yaml:"filters"`
+			TalkDuck   string           `yaml:"talk_duck"`
 		} `yaml:"webrtc"`
 	}
 
@@ -33,6 +35,15 @@ func Init() {
 	app.LoadConfig(&cfg)
 
 	log = app.GetLogger("webrtc")
+
+	if cfg.Mod.TalkDuck != "" {
+		if d, err := time.ParseDuration(cfg.Mod.TalkDuck); err == nil && d > 0 {
+			webrtc.TalkDuck = d
+			log.Info().Msgf("[webrtc] talk_duck: camera audio muted for the talker, hold %s", d)
+		} else {
+			log.Warn().Msgf("[webrtc] talk_duck: invalid duration %q, ignored", cfg.Mod.TalkDuck)
+		}
+	}
 
 	if log.Debug().Enabled() {
 		itfs, _ := net.Interfaces()
